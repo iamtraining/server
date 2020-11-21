@@ -1,5 +1,5 @@
 use std::net::{TcpListener, TcpStream};
-use std::io::Read;
+use std::io::{Read, Write, Result as IoResult};
 use std::convert::TryFrom;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Debug};
@@ -7,10 +7,15 @@ use std::fmt::Result as FmtResult;
 use std::str;
 use std::str::FromStr;
 use std::collections::HashMap;
+use std::env;
+use std::fs;
 
 fn main() {
+    let default = format!("{}/view", env!("CARGO_MANIFEST_DIR"));
+    let view_path = env::var("VIEW_PATH").unwrap_or(default);
+    println!("view path: {}", view_path);
     let server = Server::new("127.0.0.1:3000".to_string());
-    server.run();
+    server.run(HttpHandler::new(view_path));
 }
 // GET /rawr?r=a&w=r&x=d HTTP/1.1\r\n ....
 
@@ -24,7 +29,7 @@ impl Server {
             addr,
         }
     }
-    fn run(self) {
+    fn run(self, mut handler: impl Handler) {
         let listener = TcpListener::bind(&self.addr).unwrap();
 
         loop {
@@ -35,11 +40,16 @@ impl Server {
                         Ok(_) => {
                             println!("request received: \n{}", String::from_utf8_lossy(&buf));
                             //Request::try_from(&buf as &[u8]);
-                            match Request::try_from(&buf[..]) {
+                            let response = match Request::try_from(&buf[..]) {
                                 Ok(request) => {
-                                    dbg!(request);
-                                },
-                                Err(err) => println!("cant parse a request")
+                                    handler.handle(&request)
+                                }
+                                Err(err) => {
+                                    handler.handle_bad_request(&err)
+                                }
+                            };
+                            if let Err(err) = response.send(&mut stream) {
+                                println!("sending responsa failure {}", err)
                             }
                         },
                         Err(err) => println!("cant read {}", err)
@@ -93,7 +103,7 @@ impl From<MethodError> for RequestError {
 }
 
 #[derive(Debug)]
-struct Request<'buf> {
+pub struct Request<'buf> {
     method: HTTPMethod,
     path:  &'buf str,
     query_string: Option<QueryString<'buf>>,
@@ -102,6 +112,15 @@ struct Request<'buf> {
 impl<'buf> Request<'buf> {
     fn from_byte_to_struct(buf: &[u8]) -> Result<Self, String> {
         unimplemented!()
+    }
+    fn path(&self) -> &str {
+        &self.path
+    }
+    fn method(&self) -> &HTTPMethod {
+        &self.method
+    }
+    fn query_string(&self) -> Option<&QueryString> {
+        self.query_string.as_ref()
     }
 }
 
@@ -158,7 +177,7 @@ impl<'buf> TryFrom<&'buf [u8]> for Request<'buf> {
     }
 }
 
-enum RequestError {
+pub enum RequestError {
     Request,
     Protocol,
     Encode,
@@ -225,12 +244,12 @@ impl<'buf> From<&'buf str> for QueryString<'buf> {
     fn from(s: &'buf str) -> Self {
         let mut map = HashMap::new();
 
-        for s_s in s.split('&') {
-            let mut k = s_s;
+        for sub_str in s.split('&') {
+            let mut k = sub_str;
             let mut v = "";
-            if let Some(i) = s.find('=') {
-                k = &s_s[..i];
-                v = &s_s[i+1..];
+            if let Some(i) = sub_str.find('=') {
+                k = &sub_str[..i];
+                v = &sub_str[i+1..];
             }
 
             map.entry(k)
@@ -245,6 +264,86 @@ impl<'buf> From<&'buf str> for QueryString<'buf> {
 
         QueryString {
             params:map,
+        }
+    }
+}
+pub struct Response {
+    status_code: StatusCode,
+    body: Option<String>,
+}
+
+impl Response {
+    fn new(code: StatusCode, body: Option<String>) -> Self {
+        Response {
+            status_code: code,
+            body
+        }
+    }
+    fn send(&self, stream: &mut impl Write) -> IoResult<()> {
+        let body = match &self.body {
+            Some(body) => body,
+            None => "",
+        };
+        write!(stream, "HTTP/1.1 {} {}\r\n\r\n{}", self.status_code, self.status_code.msg(), body)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StatusCode {
+    StatusOk = 200,
+    StatusBadRequest = 400,
+    StatusNotFound = 404,
+}
+
+
+impl StatusCode {
+    fn msg(&self) -> &str {
+        match self {
+            Self::StatusOk => "ok",
+            Self::StatusBadRequest => "bad request",
+            Self::StatusNotFound => "not found"
+        }
+    }
+}
+impl Display for StatusCode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "{}", *self as u32)
+    }
+}
+
+pub trait Handler {
+    fn handle(&mut self, request: &Request) -> Response;
+    fn handle_bad_request(&mut self, err: &RequestError)-> Response {
+        println!("parse request failure {}", err);
+        Response::new(StatusCode::StatusBadRequest, None)
+    }
+}
+
+struct HttpHandler {
+    view_path: String
+}
+
+impl HttpHandler {
+    fn new(view_path: String) -> Self {
+        Self {
+            view_path
+        }
+    }
+    fn render(&self, view_path: &str) -> Option<String> {
+        let path = format!("{}/{}", self.view_path, view_path);
+        fs::read_to_string(path).ok()
+    }
+}
+
+impl Handler for HttpHandler {
+    fn handle(&mut self, request: &Request) -> Response {
+        match request.method() {
+            HTTPMethod::GET => match request.path() {
+                "/" => Response::new(StatusCode::StatusOk, self.render("main.html")),
+                "/hello" => Response::new(StatusCode::StatusOk, self.render("hello.html")),
+                _ => Response::new(StatusCode::StatusNotFound, None)
+            }
+            _ => Response::new(StatusCode::StatusNotFound, None)
         }
     }
 }
